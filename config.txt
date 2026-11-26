@@ -25,5 +25,5 @@ SYMBOLS=123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@#$
 # CPU seconds one puzzle may take before the client gets 503 (0 = no limit)
 SOLVE_TIMEOUT=20
 
-# Seconds a client may stall while sending or receiving
+# Seconds a client has, in total, for the TLS handshake and sending its request
 IO_TIMEOUT=10

@@ -25,6 +25,12 @@ static int name_is(const char *s, size_t len, const char *name)
     return 1;
 }
 
+/* RFC 7230 token characters. Keeps control bytes such as '\n' out of the method, which is logged. */
+static int is_tchar(unsigned char c)
+{
+    return isalnum(c) || (c != '\0' && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+}
+
 static int parse_request_line(const char *line, const char *eol, HttpRequest *req)
 {
     const char *sp1 = memchr(line, ' ', (size_t)(eol - line));
@@ -43,6 +49,9 @@ static int parse_request_line(const char *line, const char *eol, HttpRequest *re
         return -1;
     if (eol - ver < 6 || strncmp(ver, "HTTP/", 5) != 0)
         return -1;
+    for (size_t i = 0; i < mlen; i++)
+        if (!is_tchar((unsigned char)line[i]))
+            return -1;
     memcpy(req->method, line, mlen);
     req->method[mlen] = '\0';
     memcpy(req->path, sp1 + 1, plen);

@@ -190,6 +190,14 @@ static void test_http_parse(void)
     CHECK(http_parse_head(neg, strlen(neg), &r) == -1);
     CHECK(http_parse_head(nolen, strlen(nolen), &r) == -1);
     CHECK(http_parse_head("\r\n\r\n", 4, &r) == -1);
+
+    /* the method is written to the log: anything but token characters is rejected */
+    const char *newline = "PO\nST / HTTP/1.1\r\n\r\n", *control = "G\x01T / HTTP/1.1\r\n\r\n";
+    const char *token = "M-SEARCH * HTTP/1.1\r\n\r\n";
+
+    CHECK(http_parse_head(newline, strlen(newline), &r) == -1);
+    CHECK(http_parse_head(control, strlen(control), &r) == -1);
+    CHECK(http_parse_head(token, strlen(token), &r) == 1 && strcmp(r.method, "M-SEARCH") == 0);
 }
 
 static void test_http_response(void)

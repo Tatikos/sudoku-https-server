@@ -8,37 +8,40 @@
 #define MAX_CELLS (SUDOKU_MAX_N * SUDOKU_MAX_N)
 #define SUDOKU_RESTART (-3)
 #define FIRST_NODE_LIMIT 64UL
-#define KEPT_LEVELS 128 /* search nodes kept allocated between solves (16x16 reaches ~110) */
 
-/* One search node; the arrays live in one block right after the struct, sized for n. */
+/* One undoable change to the board: candidates narrowed, or a digit placed. */
 typedef struct {
-    uint64_t *cand;            /* n*n: candidate digits of an empty cell, 0 once filled */
-    uint64_t *row, *col, *box; /* n each: digits placed */
-    unsigned char *val;        /* n*n */
-    int left;                  /* empty cells */
-} State;
+    int p;        /* cell */
+    int digit;    /* -1: candidates narrowed; else the digit (0-based) placed in p */
+    uint64_t old; /* cand[p] before the change */
+} Change;
 
+/*
+ * The search works on one board and undoes failed branches from a log of changes,
+ * so its memory is fixed by the board size (at most n*n*(n+1) changes on the
+ * current path, 4.3 MB for 64x64) however deep the search goes.
+ */
 typedef struct {
     int n, bs, nn;
-    size_t bytes;                /* size of a State's array block */
     uint64_t full;               /* the n lowest bits */
-    int qlen;
+    int qlen, left;              /* queued singles / empty cells */
+    size_t tlen;                 /* changes in the log */
     unsigned long nodes, limit;  /* branch nodes so far / allowed before a restart */
     unsigned rng;                /* 0 = deterministic choices */
     clock_t deadline;            /* 0 = unlimited */
     Board *out;
     /* not cleared per solve: */
+    uint64_t cand[MAX_CELLS];    /* candidate digits of an empty cell, 0 once filled */
+    uint64_t row[SUDOKU_MAX_N], col[SUDOKU_MAX_N], box[SUDOKU_MAX_N]; /* digits placed */
+    unsigned char val[MAX_CELLS];
     int queue[MAX_CELLS];        /* cells that just dropped to one candidate */
     unsigned short unit[3][SUDOKU_MAX_N][SUDOKU_MAX_N]; /* cells of row / column / box u */
 } Solver;
 
-/*
- * level[d] = search node at depth d, allocated on first use and reused by later
- * solves: freeing them each time made glibc return the pages and fault them back in.
- * ponytail: process-wide, not thread-safe; each server worker is single-threaded.
- */
-static State **level;
-static int nlevels, level_n;
+/* ponytail: process-wide, not thread-safe; each server worker is single-threaded. */
+static Solver solver;
+static Change *trail;
+static size_t trail_cap;
 
 static unsigned next_rand(unsigned *state)
 {
@@ -157,15 +160,17 @@ int sudoku_valid(const Board *b)
     return scan(b, row, col, box) == 0;
 }
 
-/* Removes a digit from an empty cell; 0 if that leaves the cell with no candidate. */
-static int eliminate(Solver *s, State *st, int p, uint64_t bit)
+/* Removes a digit from an empty cell, logging at *t; 0 if the cell is left with no candidate. */
+static inline int eliminate(Solver *s, Change **t, int p, uint64_t bit)
 {
-    uint64_t m = st->cand[p];
+    uint64_t m = s->cand[p];
 
     if (!(m & bit))
         return 1;
+    **t = (Change){ p, -1, m };
+    ++*t;
     m &= ~bit;
-    st->cand[p] = m;
+    s->cand[p] = m;
     if (m == 0)
         return 0;
     if ((m & (m - 1)) == 0)
@@ -173,54 +178,74 @@ static int eliminate(Solver *s, State *st, int p, uint64_t bit)
     return 1;
 }
 
-static int assign(Solver *s, State *st, int p, int d)
+static int assign(Solver *s, int p, int d)
 {
-    int n = s->n, r = p / n, c = p % n, b = (r / s->bs) * s->bs + c / s->bs;
+    int n = s->n, r = p / n, c = p % n, b = (r / s->bs) * s->bs + c / s->bs, ok = 1;
     const unsigned short *rc = s->unit[0][r], *cc = s->unit[1][c], *bc = s->unit[2][b];
     uint64_t bit = (uint64_t)1 << d;
+    Change *t = trail + s->tlen;
 
-    if (!(st->cand[p] & bit))
+    if (!(s->cand[p] & bit))
         return 0;
-    st->cand[p] = 0;
-    st->val[p] = (unsigned char)(d + 1);
-    st->left--;
-    st->row[r] |= bit;
-    st->col[c] |= bit;
-    st->box[b] |= bit;
-    for (int i = 0; i < n; i++) {
-        if (!eliminate(s, st, rc[i], bit) || !eliminate(s, st, cc[i], bit) ||
-            !eliminate(s, st, bc[i], bit))
-            return 0;
+    *t++ = (Change){ p, d, s->cand[p] };
+    s->cand[p] = 0;
+    s->val[p] = (unsigned char)(d + 1);
+    s->left--;
+    s->row[r] |= bit;
+    s->col[c] |= bit;
+    s->box[b] |= bit;
+    for (int i = 0; i < n && ok; i++)
+        ok = eliminate(s, &t, rc[i], bit) && eliminate(s, &t, cc[i], bit) && eliminate(s, &t, bc[i], bit);
+    s->tlen = (size_t)(t - trail);
+    return ok;
+}
+
+/* Rolls the board back to the moment the log held mark changes. */
+static void undo(Solver *s, size_t mark)
+{
+    while (s->tlen > mark) {
+        const Change *ch = &trail[--s->tlen];
+
+        if (ch->digit >= 0) {
+            int r = ch->p / s->n, c = ch->p % s->n;
+            uint64_t bit = (uint64_t)1 << ch->digit;
+
+            s->val[ch->p] = 0;
+            s->left++;
+            s->row[r] &= ~bit;
+            s->col[c] &= ~bit;
+            s->box[(r / s->bs) * s->bs + c / s->bs] &= ~bit;
+        }
+        s->cand[ch->p] = ch->old;
     }
-    return 1;
 }
 
 /* Naked singles: fills every queued cell with its last candidate. */
-static int drain(Solver *s, State *st)
+static int drain(Solver *s)
 {
     while (s->qlen > 0) {
         int p = s->queue[--s->qlen];
 
-        if (st->val[p])
+        if (s->val[p])
             continue;
-        if (!st->cand[p] || !assign(s, st, p, __builtin_ctzll(st->cand[p])))
+        if (!s->cand[p] || !assign(s, p, __builtin_ctzll(s->cand[p])))
             return 0;
     }
     return 1;
 }
 
 /* Hidden singles: a digit with one possible cell in a row, column or box goes there. */
-static int hidden_singles(Solver *s, State *st, int *progress)
+static int hidden_singles(Solver *s, int *progress)
 {
     for (int kind = 0; kind < 3; kind++) {
-        uint64_t *placed = kind == 0 ? st->row : kind == 1 ? st->col : st->box;
+        const uint64_t *placed = kind == 0 ? s->row : kind == 1 ? s->col : s->box;
 
         for (int u = 0; u < s->n; u++) {
             const unsigned short *cells = s->unit[kind][u];
             uint64_t once = 0, twice = 0, hidden;
 
             for (int i = 0; i < s->n; i++) {
-                uint64_t m = st->cand[cells[i]];
+                uint64_t m = s->cand[cells[i]];
 
                 twice |= once & m;
                 once |= m;
@@ -233,88 +258,46 @@ static int hidden_singles(Solver *s, State *st, int *progress)
                 int i = 0;
 
                 hidden &= hidden - 1;
-                while (i < s->n && !(st->cand[cells[i]] & bit))
+                while (i < s->n && !(s->cand[cells[i]] & bit))
                     i++;
                 if (i == s->n) {
                     if (placed[u] & bit)
                         continue;
                     return 0;
                 }
-                if (!assign(s, st, cells[i], __builtin_ctzll(bit)))
+                if (!assign(s, cells[i], __builtin_ctzll(bit)))
                     return 0;
                 *progress = 1;
             }
-            if (!drain(s, st))
+            if (!drain(s))
                 return 0;
         }
     }
     return 1;
 }
 
-static int propagate(Solver *s, State *st)
+static int propagate(Solver *s)
 {
     int progress;
 
-    if (!drain(s, st))
+    if (!drain(s))
         return 0;
     do {
         progress = 0;
-        if (!hidden_singles(s, st, &progress))
+        if (!hidden_singles(s, &progress))
             return 0;
-    } while (progress && st->left > 0);
+    } while (progress && s->left > 0);
     return 1;
 }
 
-static void copy_state(const Solver *s, State *dst, const State *src)
-{
-    memcpy(dst->cand, src->cand, s->bytes);
-    dst->left = src->left;
-}
-
-static State *get_level(const Solver *s, int depth)
-{
-    State *st;
-
-    if (depth >= nlevels) {
-        int cap = depth * 2 + 8;
-        State **grown = realloc(level, (size_t)cap * sizeof *grown);
-
-        if (!grown)
-            return NULL;
-        memset(grown + nlevels, 0, (size_t)(cap - nlevels) * sizeof *grown);
-        level = grown;
-        nlevels = cap;
-    }
-    if (level[depth])
-        return level[depth];
-    st = malloc(sizeof *st + s->bytes); /* sizeof(State) is a multiple of 8: arrays stay aligned */
-    if (!st)
-        return NULL;
-    st->cand = (uint64_t *)(st + 1);
-    st->row = st->cand + s->nn;
-    st->col = st->row + s->n;
-    st->box = st->col + s->n;
-    st->val = (unsigned char *)(st->box + s->n);
-    return level[depth] = st;
-}
-
-static void free_levels(int from)
-{
-    for (int i = from; i < nlevels; i++) {
-        free(level[i]);
-        level[i] = NULL;
-    }
-}
-
 /* Branches on the empty cell with the fewest candidates (ties random after a restart). */
-static int search(Solver *s, int depth)
+static int search(Solver *s)
 {
-    State *st = level[depth], *child;
     int best = -1, fewest = SUDOKU_MAX_N + 1, ties = 0;
     uint64_t digits;
 
-    if (st->left == 0) {
-        memcpy(s->out->cell, st->val, (size_t)s->nn);
+    if (s->left == 0) {
+        memcpy(s->out->cell, s->val, (size_t)s->nn);
         return SUDOKU_SOLVED;
     }
     if (++s->nodes > s->limit)
@@ -325,9 +308,9 @@ static int search(Solver *s, int depth)
     for (int p = 0; p < s->nn; p++) {
         int k;
 
-        if (!st->cand[p])
+        if (!s->cand[p])
             continue;
-        k = __builtin_popcountll(st->cand[p]);
+        k = __builtin_popcountll(s->cand[p]);
         if (k < fewest) {
             fewest = k;
             best = p;
@@ -341,12 +324,9 @@ static int search(Solver *s, int depth)
     if (best < 0)
         return SUDOKU_UNSOLVABLE;
 
-    child = get_level(s, depth + 1);
-    if (!child)
-        return SUDOKU_NOMEM;
-    for (digits = st->cand[best]; digits;) {
+    for (digits = s->cand[best]; digits;) {
         uint64_t pick = digits;
-        int res;
+        size_t mark = s->tlen;
 
         if (s->rng)
             for (unsigned skip = next_rand(&s->rng) % (unsigned)__builtin_popcountll(digits); skip; skip--)
@@ -354,43 +334,45 @@ static int search(Solver *s, int depth)
         pick &= ~pick + 1;
         digits &= ~pick;
 
-        copy_state(s, child, st);
         s->qlen = 0;
-        if (!assign(s, child, best, __builtin_ctzll(pick)) || !propagate(s, child))
-            continue;
-        res = search(s, depth + 1);
-        if (res != SUDOKU_UNSOLVABLE)
-            return res;
+        if (assign(s, best, __builtin_ctzll(pick)) && propagate(s)) {
+            int res = search(s);
+
+            if (res != SUDOKU_UNSOLVABLE)
+                return res;
+        }
+        undo(s, mark);
     }
     return SUDOKU_UNSOLVABLE;
 }
 
-/* Fills level 0 from the board and propagates; 0 if the clues already contradict. */
-static int init_root(Solver *s, const Board *b, State *st)
+/* Loads the board and propagates; 0 if the clues already contradict. */
+static int init_root(Solver *s, const Board *b)
 {
-    if (scan(b, st->row, st->col, st->box) < 0)
+    if (scan(b, s->row, s->col, s->box) < 0)
         return 0;
-    st->left = 0;
+    s->left = 0;
     s->qlen = 0;
+    s->tlen = 0;
     for (int r = 0; r < s->n; r++) {
         for (int c = 0; c < s->n; c++) {
             int p = r * s->n + c;
             uint64_t m;
 
-            st->val[p] = b->cell[p];
-            st->cand[p] = 0;
+            s->val[p] = b->cell[p];
+            s->cand[p] = 0;
             if (b->cell[p])
                 continue;
-            m = s->full & ~(st->row[r] | st->col[c] | st->box[(r / s->bs) * s->bs + c / s->bs]);
+            m = s->full & ~(s->row[r] | s->col[c] | s->box[(r / s->bs) * s->bs + c / s->bs]);
             if (!m)
                 return 0;
-            st->cand[p] = m;
-            st->left++;
+            s->cand[p] = m;
+            s->left++;
             if ((m & (m - 1)) == 0)
                 s->queue[s->qlen++] = p;
         }
     }
-    return propagate(s, st);
+    return propagate(s);
 }
 
 /*
@@ -402,46 +384,47 @@ static int init_root(Solver *s, const Board *b, State *st)
  */
 int sudoku_solve(Board *b, double timeout_s)
 {
-    Solver s;
+    Solver *s = &solver;
+    size_t need = (size_t)b->n * (size_t)b->n * (size_t)(b->n + 1), root;
     unsigned long limit = FIRST_NODE_LIMIT;
     int res;
 
-    memset(&s, 0, offsetof(Solver, queue));
-    s.n = b->n;
-    s.bs = isqrt_int(b->n);
-    s.nn = b->n * b->n;
-    s.bytes = (size_t)(s.nn + 3 * s.n) * sizeof(uint64_t) + (size_t)s.nn;
-    s.full = b->n == 64 ? ~(uint64_t)0 : ((uint64_t)1 << b->n) - 1;
-    s.out = b;
-    for (int u = 0; u < s.n; u++) {
-        for (int i = 0; i < s.n; i++) {
-            s.unit[0][u][i] = (unsigned short)(u * s.n + i);
-            s.unit[1][u][i] = (unsigned short)(i * s.n + u);
-            s.unit[2][u][i] = (unsigned short)(((u / s.bs) * s.bs + i / s.bs) * s.n +
-                                               (u % s.bs) * s.bs + i % s.bs);
+    /* the log is kept between solves: freeing it made glibc return and re-fault its pages */
+    if (trail_cap < need) {
+        Change *grown = realloc(trail, need * sizeof *grown);
+
+        if (!grown)
+            return SUDOKU_NOMEM;
+        trail = grown;
+        trail_cap = need;
+    }
+    memset(s, 0, offsetof(Solver, cand));
+    s->n = b->n;
+    s->bs = isqrt_int(b->n);
+    s->nn = b->n * b->n;
+    s->full = b->n == 64 ? ~(uint64_t)0 : ((uint64_t)1 << b->n) - 1;
+    s->out = b;
+    for (int u = 0; u < s->n; u++) {
+        for (int i = 0; i < s->n; i++) {
+            s->unit[0][u][i] = (unsigned short)(u * s->n + i);
+            s->unit[1][u][i] = (unsigned short)(i * s->n + u);
+            s->unit[2][u][i] = (unsigned short)(((u / s->bs) * s->bs + i / s->bs) * s->n +
+                                                (u % s->bs) * s->bs + i % s->bs);
         }
     }
     if (timeout_s > 0)
-        s.deadline = clock() + (clock_t)(timeout_s * CLOCKS_PER_SEC);
+        s->deadline = clock() + (clock_t)(timeout_s * CLOCKS_PER_SEC);
 
-    if (level_n != s.n) {
-        free_levels(0);
-        level_n = s.n;
+    if (!init_root(s, b))
+        return SUDOKU_UNSOLVABLE;
+    root = s->tlen;
+    for (unsigned attempt = 0;; attempt++, limit *= 2) {
+        s->nodes = 0;
+        s->limit = limit;
+        s->rng = attempt * 2654435761u;
+        res = search(s);
+        if (res != SUDOKU_RESTART)
+            return res;
+        undo(s, root);
     }
-    if (!get_level(&s, 0)) {
-        res = SUDOKU_NOMEM;
-    } else if (!init_root(&s, b, level[0])) {
-        res = SUDOKU_UNSOLVABLE;
-    } else {
-        for (unsigned attempt = 0;; attempt++, limit *= 2) {
-            s.nodes = 0;
-            s.limit = limit;
-            s.rng = attempt * 2654435761u;
-            res = search(&s, 0);
-            if (res != SUDOKU_RESTART)
-                break;
-        }
-    }
-    free_levels(KEPT_LEVELS);
-    return res;
 }
