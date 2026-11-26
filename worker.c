@@ -22,6 +22,7 @@
 static volatile sig_atomic_t g_stop;
 static sem_t *slot;      /* shared idle-worker count */
 static int holding_slot; /* this worker is counted as busy */
+static struct timespec read_deadline; /* the current client must have sent its request by then */
 
 static void on_stop(int sig)
 {
@@ -146,14 +147,41 @@ static void handle_request(const WorkerCtx *w, SSL *ssl, const char *ip)
     solve_and_reply(w, ssl, buf + req.head_len, (size_t)req.content_length);
 }
 
+/*
+ * Runs before every socket read OpenSSL makes (handshake and request alike) and
+ * limits it to what is left of the connection's IO_TIMEOUT budget. A per-read
+ * timeout alone is not enough: a client sending one byte every few seconds would
+ * reset it on every byte and could hold the worker forever.
+ */
+static long limit_read(BIO *b, int oper, const char *argp, size_t len, int argi,
+                       long argl, int ret, size_t *processed)
+{
+    struct timespec now;
+    struct timeval tv;
+    long ms;
+
+    (void)argp, (void)len, (void)argi, (void)argl, (void)processed;
+    if (oper != BIO_CB_READ)
+        return ret;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ms = (read_deadline.tv_sec - now.tv_sec) * 1000L + (read_deadline.tv_nsec - now.tv_nsec) / 1000000L;
+    if (ms <= 0)
+        return -1; /* budget spent: the read fails and the connection is dropped */
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt((int)BIO_get_fd(b, NULL), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return ret;
+}
+
 static void serve(const WorkerCtx *w, int fd, const struct sockaddr_in *peer)
 {
     struct timeval tv = { w->cfg->io_timeout, 0 };
     char ip[INET_ADDRSTRLEN] = "?";
     SSL *ssl;
 
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    clock_gettime(CLOCK_MONOTONIC, &read_deadline);
+    read_deadline.tv_sec += w->cfg->io_timeout;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); /* the reply is one small write */
     inet_ntop(AF_INET, &peer->sin_addr, ip, sizeof ip);
 
     ssl = SSL_new(w->ssl_ctx);
@@ -162,6 +190,7 @@ static void serve(const WorkerCtx *w, int fd, const struct sockaddr_in *peer)
         return;
     }
     SSL_set_fd(ssl, fd);
+    BIO_set_callback_ex(SSL_get_rbio(ssl), limit_read);
     if (SSL_accept(ssl) > 0) {
         handle_request(w, ssl, ip);
         SSL_shutdown(ssl);

@@ -55,7 +55,7 @@ config.txt
 ----------
 PROCESSES (pool size), PORT (default 4433), HOME (folder for the log, created if missing),
 LOGS (log file name inside HOME), CERT / KEY, MAX_SIZE, SYMBOLS, SOLVE_TIMEOUT (CPU seconds
-per puzzle), IO_TIMEOUT (seconds a client may stall). Lines starting with # are comments.
+per puzzle), IO_TIMEOUT (seconds a client has, in total, for the TLS handshake and its request). Lines starting with # are comments.
 
 Log
 ---

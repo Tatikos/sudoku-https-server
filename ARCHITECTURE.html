@@ -33,8 +33,14 @@ falsely full. Measured: 10000 requests over 40 and 32 concurrent connections, no
 connections, every request beyond the 40 in service was closed unanswered (4513 and 2656 of 10000 answered, the
 rejected client threads retrying at once), and the next 40-connection run again had no rejections, so no slot leaks.
 A worker that dies while busy never posts, and its replacement posts once at start, so the count stays right.</p>
-<p>Stalled clients cannot pin a worker: each accepted socket gets SO_RCVTIMEO and SO_SNDTIMEO of IO_TIMEOUT seconds,
-and the solver has a CPU-time limit (SOLVE_TIMEOUT, then 503).</p>
+<p>Slow or stalled clients cannot pin a worker. A per-read timeout is not enough, because a client sending one byte
+every few seconds resets it on every byte. Instead a callback on the connection's socket BIO runs before every read
+OpenSSL makes, during the handshake and the request alike, and sets SO_RCVTIMEO to what is left of a total budget of
+IO_TIMEOUT seconds; once the budget is spent the read fails and the connection is dropped. Tested with IO_TIMEOUT=10:
+an idle connection, a client trickling a TLS record one byte every 2 s, and a client trickling its request after the
+handshake were all cut off after about 10 s (the old per-read timeout would have let the trickling record run for
+about 17 minutes). The reply is a single small write under SO_SNDTIMEO, and the solver has a CPU-time limit
+(SOLVE_TIMEOUT, then 503).</p>
 
 <h2>3. TLS and HTTP</h2>
 <p>The parent builds one SSL_CTX (TLS 1.2 or newer, certificate chain and private key loaded and checked against each
@@ -62,7 +68,10 @@ oversized body, an unsolvable puzzle and a solver timeout.</p>
 from the cell's row, column and box; a cell left with one candidate is queued and filled (naked single), and a digit
 that fits only one cell of a row, column or box goes there (hidden single). This runs to a fixpoint; a cell with no
 candidate or a digit with no place means a contradiction. Then the search branches on the empty cell with the fewest
-candidates, copying the node (2.7 KB for 16x16) for each digit tried. Rule violations among the clues are found
+candidates. Every change to the board is written to a log, and a failed branch is rolled back from it, so the search
+needs one board and a log of at most n*n*(n+1) entries per worker (4.3 MB for 64x64) however deep it goes; copying
+the board for every branch instead would have needed 134 MB for an empty 64x64 board, which goes 3501 levels deep.
+Rule violations among the clues are found
 before any search and answered with 422.</p>
 <p>Backtracking on sparse puzzles has a heavy tail: in 3000 random 16x16 puzzles with 30% clues one took 54 s with a
 plain search. The search therefore gets a node budget (64, doubling on every restart); when it runs out the search
@@ -70,8 +79,8 @@ starts again from the propagated root with random tie-breaking between equally c
 order. The propagated root is kept, so a restart costs nothing extra.</p>
 <p>This replaced a first version built on dancing links (Algorithm X), which was 2 to 3 times slower per puzzle. Two
 other measured fixes: row/column/box cell indices are precomputed per solve (the divisions in the inner loops had
-doubled the cost), and search nodes are kept in a per-process pool sized for the board, because allocating and freeing
-them per puzzle made glibc hand pages back to the kernel and fault them in again on the next puzzle.</p>
+doubled the cost), and the solver's memory is allocated once per worker and reused, because allocating and freeing
+it per puzzle made glibc hand pages back to the kernel and fault them in again on the next puzzle.</p>
 <p>Solver alone, 10000 random 16x16 puzzles each: 50% clues 0.03 ms average, 40% clues 0.12 ms, 30% clues 0.20 ms,
 worst case under 10 ms. Limit: there is no inference beyond singles, so very sparse boards from 25x25 up can exhaust
 SOLVE_TIMEOUT.</p>
@@ -88,7 +97,9 @@ memory only for slots in use.</p>
 <h2>6. Logging through a message queue</h2>
 <p>The parent creates a System V message queue; the logger process is its only consumer. After parsing the request
 line a worker sends (arrival time, client IP, what) with a blocking msgsnd and carries on. The logger appends
-"&lt;unix time&gt; &lt;ip&gt; &lt;game request&gt;" lines to HOME/LOGS (other methods are logged as &lt;METHOD request&gt;). Shutdown
+"&lt;unix time&gt; &lt;ip&gt; &lt;game request&gt;" lines to HOME/LOGS (other methods are logged as &lt;METHOD request&gt;). The
+parser accepts only RFC 7230 token characters in a method, so a client cannot forge log lines with a newline or other
+control bytes (such requests get 400 and are not logged). Shutdown
 sends the logger a stop message only after all workers are gone, so records queued before it are written first.
 In the tests every request produced exactly one line (14300 requests, 14300 lines).</p>
 
