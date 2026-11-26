@@ -1,0 +1,29 @@
+# Server Configuration File
+
+# The Number of Processes in the pool
+PROCESSES=40
+
+# The Port number of the server
+PORT=4433
+
+# The folder of the server (created if missing; holds the logfile)
+HOME=./game
+
+# The logfile (inside HOME)
+LOGS=logs.txt
+
+# TLS certificate and private key (run.sh creates them if missing)
+CERT=certs/cert.pem
+KEY=certs/key.pem
+
+# Max Game Size (rows = columns, a perfect square up to 64)
+MAX_SIZE=64
+
+# Game Symbols: the i-th symbol stands for the value i, '0' is an empty cell
+SYMBOLS=123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@#$
+
+# CPU seconds one puzzle may take before the client gets 503 (0 = no limit)
+SOLVE_TIMEOUT=20
+
+# Seconds a client may stall while sending or receiving
+IO_TIMEOUT=10

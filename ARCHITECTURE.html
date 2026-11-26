@@ -1,0 +1,138 @@
+<h1>Sudoku HTTPS server: architecture</h1>
+<p>EPL421, assignment 4. C11, POSIX, OpenSSL. Source of this document: ARCHITECTURE.html (the PDF is rendered from it).</p>
+
+<h2>1. Overview</h2>
+<pre>
+   clients --TCP/TLS--> listening socket
+                              | accept()
+                        +-----v------+  idle worker?  no --> close() unanswered
+                        |   parent   |--------------+
+                        | dispatcher |  yes: socket passed over a socketpair (SCM_RIGHTS)
+                        +-----+------+              |
+                              | fork     +----------v-----------+        +-----------+
+                              +--------->| worker 1 ... worker N| msgsnd | logger    |--> game/logs.txt
+                                         | TLS + HTTP + solver  |------->| msgrcv    |
+                                         +----------+-----------+        +-----------+
+   shared memory: semaphore of idle workers, solution cache (seqlock slots)
+</pre>
+<p>One parent, one logger and PROCESSES workers (40 by default) are forked at start-up. The parent creates everything
+that is shared (TLS context, listening socket, socketpair, semaphore, cache, message queue), forks, then accepts every
+connection and assigns it to an idle worker; it never serves a request itself. All I/O is ordinary blocking I/O; there
+is no select/poll/epoll and no O_NONBLOCK anywhere.</p>
+
+<h2>2. Process pool and concurrency</h2>
+<p>As the assignment describes, the parent assigns each request to a process that has no work, and when there are more
+requests than processes the request is rejected by closing its socket without any reply. The number of idle workers is
+a POSIX semaphore in shared memory. Each worker posts it once when it starts. For every accepted connection the parent
+calls sem_trywait: on success it sends the socket descriptor, with the client address as payload, over a Unix datagram
+socketpair (SCM_RIGHTS), where all idle workers block in recvmsg and the kernel gives each message to one of them; on
+failure every worker is busy and the parent closes the connection. A worker serves one connection at a time.</p>
+<p>A worker posts the semaphore again just before it writes its reply, not after closing. A client can only start its
+next request after reading that reply, so a client that keeps at most PROCESSES connections open never finds the pool
+falsely full. Measured: 10000 requests over 40 and 32 concurrent connections, no rejections; over 64 and 200
+connections, every request beyond the 40 in service was closed unanswered (4513 and 2656 of 10000 answered, the
+rejected client threads retrying at once), and the next 40-connection run again had no rejections, so no slot leaks.
+A worker that dies while busy never posts, and its replacement posts once at start, so the count stays right.</p>
+<p>Stalled clients cannot pin a worker: each accepted socket gets SO_RCVTIMEO and SO_SNDTIMEO of IO_TIMEOUT seconds,
+and the solver has a CPU-time limit (SOLVE_TIMEOUT, then 503).</p>
+
+<h2>3. TLS and HTTP</h2>
+<p>The parent builds one SSL_CTX (TLS 1.2 or newer, certificate chain and private key loaded and checked against each
+other) which the workers inherit. Per connection a worker runs SSL_new, SSL_accept, SSL_read, SSL_write, SSL_shutdown.
+Every request is a full TLS handshake, so the handshake is the largest cost and was tuned by measurement:</p>
+<ul>
+<li>ECDSA P-256 certificate instead of the assignment's RSA-2048 example: the handshake signature costs 0.03 ms
+instead of 0.85 ms. run.sh creates it (CN and subjectAltName from the host name, plus localhost).</li>
+<li>Key exchange limited to X25519 / P-256. OpenSSL 3.5 otherwise negotiates the post-quantum hybrid X25519MLKEM768,
+which adds ML-KEM work on both ends for no benefit here.</li>
+<li>TLS_AES_128_GCM_SHA256 preferred: SHA-256 key derivation is cheaper than AES-256/SHA-384, for the client too.</li>
+<li>No session tickets and no session cache: each connection carries one request and then closes, so resumption
+state would be computed and never used. Read-ahead lets one read() take a whole burst of records.</li>
+</ul>
+<p>With these settings an in-memory handshake costs the server 0.30 ms; SSL_new plus SSL_free costs 0.012 ms.</p>
+<p>http.c parses the request line and headers of RFC 2616 (case-insensitive header names, CRLF line ends, Content-Length
+only; conflicting duplicate Content-Length headers are rejected). The worker reads until the blank line, then reads
+exactly Content-Length body bytes into a 16 KiB buffer. Replies are always HTTP/1.1 with Date, Content-Type,
+Content-Length and Connection: close, and the connection is closed afterwards. POST gets a solution (200); every other
+method gets 501 "Method not implemented!". 400, 411, 413, 422 and 503 cover malformed input, a missing length, an
+oversized body, an unsolvable puzzle and a solver timeout.</p>
+
+<h2>4. Solver</h2>
+<p>Each empty cell holds its candidate digits as a 64-bit mask (hence the 64x64 limit). Placing a digit removes it
+from the cell's row, column and box; a cell left with one candidate is queued and filled (naked single), and a digit
+that fits only one cell of a row, column or box goes there (hidden single). This runs to a fixpoint; a cell with no
+candidate or a digit with no place means a contradiction. Then the search branches on the empty cell with the fewest
+candidates, copying the node (2.7 KB for 16x16) for each digit tried. Rule violations among the clues are found
+before any search and answered with 422.</p>
+<p>Backtracking on sparse puzzles has a heavy tail: in 3000 random 16x16 puzzles with 30% clues one took 54 s with a
+plain search. The search therefore gets a node budget (64, doubling on every restart); when it runs out the search
+starts again from the propagated root with random tie-breaking between equally constrained cells and a random digit
+order. The propagated root is kept, so a restart costs nothing extra.</p>
+<p>This replaced a first version built on dancing links (Algorithm X), which was 2 to 3 times slower per puzzle. Two
+other measured fixes: row/column/box cell indices are precomputed per solve (the divisions in the inner loops had
+doubled the cost), and search nodes are kept in a per-process pool sized for the board, because allocating and freeing
+them per puzzle made glibc hand pages back to the kernel and fault them in again on the next puzzle.</p>
+<p>Solver alone, 10000 random 16x16 puzzles each: 50% clues 0.03 ms average, 40% clues 0.12 ms, 30% clues 0.20 ms,
+worst case under 10 ms. Limit: there is no inference beyond singles, so very sparse boards from 25x25 up can exhaust
+SOLVE_TIMEOUT.</p>
+
+<h2>5. Solution cache</h2>
+<p>The test may send a puzzle several times, so solved puzzles (up to 32x32) are kept in an anonymous shared mapping
+created before the fork: 16384 direct-mapped slots chosen by an FNV-1a hash of the grid. A slot stores the whole
+puzzle and its solution and a hit requires a byte-for-byte match, so a hash collision can never return a wrong answer.
+Slots use a seqlock (a sequence counter that is odd while a writer is active): a reader that overlaps a writer sees the
+counter change and treats it as a miss, a writer that finds the slot busy skips caching. Nothing ever blocks or can
+deadlock, so a worker killed mid-write cannot hang the others. Pages are touched lazily, the 32 MiB mapping costs
+memory only for slots in use.</p>
+
+<h2>6. Logging through a message queue</h2>
+<p>The parent creates a System V message queue; the logger process is its only consumer. After parsing the request
+line a worker sends (arrival time, client IP, what) with a blocking msgsnd and carries on. The logger appends
+"&lt;unix time&gt; &lt;ip&gt; &lt;game request&gt;" lines to HOME/LOGS (other methods are logged as &lt;METHOD request&gt;). Shutdown
+sends the logger a stop message only after all workers are gone, so records queued before it are written first.
+In the tests every request produced exactly one line (14300 requests, 14300 lines).</p>
+
+<h2>7. Supervision and shutdown</h2>
+<p>The parent blocks SIGINT and SIGTERM. Its accept() is blocking with a 200 ms SO_RCVTIMEO, so it returns at least
+that often; after every accept it polls the signals with sigtimedwait (zero timeout) and reaps dead children with
+waitpid(WNOHANG), forking replacements so the pool keeps its size (workers killed with SIGKILL, idle or mid-request,
+were replaced at once and only the request being served by a killed worker failed). Handlers for those signals are
+installed explicitly: a non-interactive shell starts background jobs with SIGINT ignored, and an inherited SIG_IGN
+would otherwise swallow Ctrl+C.</p>
+<p>Shutdown: SIGTERM to every worker, wait up to 3 s, SIGKILL any survivor, stop and reap the logger, remove the message
+queue, destroy the semaphore, unmap the cache, close the listener and the socketpair. Only pids greater than zero are ever signalled (kill(-1) would hit every
+process). run.sh runs the server as a background job and waits; its trap forwards INT/TERM, waits for the server, and
+removes certs/ if it created them. Verified in a Linux container: after Ctrl+C (SIGINT to the whole process group) and
+after a SIGTERM to run.sh alone there were no processes left, no message queue, no certs/ and the port could be bound
+again.</p>
+
+<h2>8. Code structure and tests</h2>
+<table border="1" cellpadding="3">
+<tr><td>server.c</td><td>main, TLS context, listener, accept-and-dispatch loop, respawn, shutdown</td></tr>
+<tr><td>worker.c/.h</td><td>receives connections from the parent; one connection: TLS, request reading, reply</td></tr>
+<tr><td>http.c/.h</td><td>request-head parser, response builder (no sockets, unit-tested)</td></tr>
+<tr><td>sudoku.c/.h</td><td>parser, formatter, validator, solver (no sockets, unit-tested)</td></tr>
+<tr><td>cache.c/.h</td><td>shared-memory solution cache (unit-tested)</td></tr>
+<tr><td>logger.c/.h</td><td>message-queue producer and consumer</td></tr>
+<tr><td>config.c/.h</td><td>config.txt parser with range checks (unit-tested)</td></tr>
+<tr><td>tests/test_main.c</td><td>make test: the four socket-free modules, independent of the server</td></tr>
+<tr><td>tests/loadtest.py</td><td>generates random puzzles, sends them over TLS, verifies every answer</td></tr>
+<tr><td>tests/loadgen.c</td><td>C throughput client (threads, OpenSSL), replays a puzzle file and verifies every answer</td></tr>
+</table>
+<p>System calls are checked and reported with perror; allocation failure in the solver yields a 503 instead of a crash.</p>
+
+<h2>9. Measurements and difficulties</h2>
+<p>Linux container limited to 4 CPUs (Ryzen 5 2600 host; gcc 16, OpenSSL 3.5), close to the grading machine's
+4 vCPUs. 10000 distinct random 16x16 puzzles sent by tests/loadgen with 40 connections, client running on the same
+4 CPUs: every answer correct in 4.8 to 5.7 s (about 1900 requests/s). The server used 0.62 to 0.80 ms of CPU per
+request, so about 1.6 to 2 s of the machine's 4 CPUs; the client, which also verifies the certificate, used the rest.
+Where the server time goes: TLS handshake about 0.3 ms, kernel TCP work about 0.12 ms, solving 0.03 to 0.2 ms.
+Before tuning (RSA certificate, dancing-links solver) the same run took 10 to 12 s at about 2 ms of server CPU per
+request. The parent's accept-and-dispatch step did not change throughput. With one connection at a time a request takes
+1.7 ms, with no Nagle/delayed-ACK stalls. The assignment's 9x9 example returns exactly the solution it lists, and the
+501 reply has the listed status line, headers and body (plus a Date header).</p>
+<p>The real difficulties were the solver's heavy tail (section 4), finding where per-request time went (the RSA
+signature, then the solver, then page faults from freed memory), and signal handling in the shell wrapper (section 7).
+The development machine runs Windows, so the full server was built and exercised in a Linux container.</p>
+<p>Known limits: IPv4 only; no keep-alive (the assignment asks for Connection: close); a server killed with SIGKILL
+leaves its message queue behind (remove with ipcrm); sparse 25x25 and larger boards may reach SOLVE_TIMEOUT.</p>

@@ -1,0 +1,8 @@
+server
+*.o
+tests/test_main
+tests/loadgen
+tests/*.o
+game-engine.tar.gz
+certs/
+game/
